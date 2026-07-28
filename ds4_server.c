@@ -11063,6 +11063,26 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    int disk_best_tokens = 0;
+    if (cached == 0 && s->kv.enabled) {
+        pthread_mutex_lock(&s->kv_mu);
+        int idx = ds4_kvstore_find_text_prefix(&s->kv, j->req.prompt_text,
+                                               ds4_engine_model_id(s->engine),
+                                               ds4_engine_routed_quant_bits(s->engine),
+                                               s->ctx_size);
+        if (idx >= 0) disk_best_tokens = (int)s->kv.entry[idx].tokens;
+        pthread_mutex_unlock(&s->kv_mu);
+    }
+
+    if (cached == 0 && common > 0 && common >= disk_best_tokens) {
+        if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens) {
+            kv_cache_store_current(s, slot, "evict");
+        }
+        ds4_session_rewind(slot->session, common);
+        cached = common;
+        cache_source = "memory-rewind";
+    }
+
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
