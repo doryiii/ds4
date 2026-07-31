@@ -9411,12 +9411,12 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+static void kv_cache_maybe_store_continued(server *s, server_slot *slot, int current) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
-    const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
+    if (!tokens || current > tokens->len) return;
+    const int target = kv_cache_slot_continued_target(s, slot, current);
     if (target == 0) return;
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
         (void)kc;
@@ -10449,7 +10449,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            kv_cache_maybe_store_continued(p->srv, p->slot, current);
         }
         return;
     }
@@ -10490,7 +10490,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        kv_cache_maybe_store_continued(p->srv, p->slot, current);
     }
 }
 
@@ -11248,7 +11248,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s, slot);
+    if (slot->session) {
+        int tokens = ds4_session_tokens(slot->session) ? ds4_session_tokens(slot->session)->len : 0;
+        kv_cache_maybe_store_continued(s, slot, tokens);
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11376,7 +11379,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s, slot);
+            kv_cache_maybe_store_continued(s, slot, ds4_session_pos(slot->session));
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -16442,14 +16445,14 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_push(&prompt, 2);
     ds4_tokens_push(&prompt, user);      /* first task */
     ds4_tokens_push(&prompt, 3);
-    ds4_tokens_push(&prompt, assistant); /* no longer stops scanning here */
+    ds4_tokens_push(&prompt, assistant); /* stop scanning here */
     ds4_tokens_push(&prompt, 4);
-    ds4_tokens_push(&prompt, user);      /* later turn is now cached too! */
+    ds4_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
     ds4_tokens_push(&prompt, 5);
     ds4_tokens_push(&prompt, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 6);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
 
-    kc.opt.min_tokens = 7; /* Exceeds anchor position 6 */
+    kc.opt.min_tokens = 3;
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);
