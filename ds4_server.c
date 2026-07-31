@@ -16442,14 +16442,14 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_push(&prompt, 2);
     ds4_tokens_push(&prompt, user);      /* first task */
     ds4_tokens_push(&prompt, 3);
-    ds4_tokens_push(&prompt, assistant); /* stop scanning here */
+    ds4_tokens_push(&prompt, assistant); /* no longer stops scanning here */
     ds4_tokens_push(&prompt, 4);
-    ds4_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
+    ds4_tokens_push(&prompt, user);      /* later turn is now cached too! */
     ds4_tokens_push(&prompt, 5);
     ds4_tokens_push(&prompt, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 6);
 
-    kc.opt.min_tokens = 3;
+    kc.opt.min_tokens = 7; /* Exceeds anchor position 6 */
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);

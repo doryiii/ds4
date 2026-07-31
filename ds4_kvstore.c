@@ -932,13 +932,14 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
     if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
 
     /* Cold checkpoints maximize reuse across independent agent sessions.  The
-     * stable rendered chat prefix is everything before the user message that
-     * asks this specific task.  Some clients put stable user-role scaffolding
-     * first, so use the last user marker before the first assistant marker. */
+     * stable rendered chat prefix is everything before the current user message.
+     * With .kvb chained block storage, we no longer need to stop at the first
+     * assistant marker to maximize reuse, since block deduplication naturally handles
+     * branches and shared prefixes across different conversations. 
+     * We just find the last user marker before the very end of this prompt context. */
     int last_user = -1;
     for (int i = 0; i < prompt->len; i++) {
         const int token = prompt->v[i];
-        if (token == assistant_token_id) break;
         if (token == user_token_id) last_user = i;
     }
     return last_user >= kc->opt.min_tokens ? last_user : -1;
