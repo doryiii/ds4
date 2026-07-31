@@ -371,6 +371,7 @@ static bool kv_mkdir_p(const char *path) {
 
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e) {
     free(e->path);
+    free(e->text);
     memset(e, 0, sizeof(*e));
 }
 
@@ -380,6 +381,10 @@ void ds4_kvstore_clear(ds4_kvstore *kc) {
     kc->entry = NULL;
     kc->len = 0;
     kc->cap = 0;
+    if (kc->prefix_tree) {
+        raxFree(kc->prefix_tree);
+        kc->prefix_tree = NULL;
+    }
 }
 
 static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
@@ -387,7 +392,13 @@ static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
         kc->cap = kc->cap ? kc->cap * 2 : 16;
         kc->entry = kv_xrealloc(kc->entry, (size_t)kc->cap * sizeof(kc->entry[0]));
     }
+    if (!kc->prefix_tree) kc->prefix_tree = raxNew();
     kc->entry[kc->len++] = e;
+    if (e.text && e.text_bytes > 0) {
+        void *old = NULL;
+        raxInsert(kc->prefix_tree, (unsigned char *)e.text, (size_t)e.text_bytes,
+                  (void *)(uintptr_t)kc->len, &old);
+    }
 }
 
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
@@ -450,14 +461,30 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     ds4_kvstore_entry e = {0};
     uint32_t text_bytes = 0;
     bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
-    fclose(fp);
-    if (!ok) return false;
+    if (!ok) {
+        fclose(fp);
+        return false;
+    }
     const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
     if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
         UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes)
+    {
+        fclose(fp);
         return false;
+    }
     const uint64_t expected = fixed + (uint64_t)text_bytes + e.payload_bytes;
-    if ((uint64_t)st.st_size < expected) return false;
+    if ((uint64_t)st.st_size < expected) {
+        fclose(fp);
+        return false;
+    }
+    e.text = kv_xmalloc((size_t)text_bytes + 1);
+    if (text_bytes > 0 && fread(e.text, 1, text_bytes, fp) != text_bytes) {
+        free(e.text);
+        fclose(fp);
+        return false;
+    }
+    e.text[text_bytes] = '\0';
+    fclose(fp);
     memcpy(e.sha, sha, 41);
     e.path = kv_xstrdup(path);
     e.file_size = (uint64_t)st.st_size;
@@ -1192,23 +1219,33 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
+    if (!kc->prefix_tree || kc->len == 0) return -1;
+
+    raxIterator it;
+    raxStart(&it, kc->prefix_tree);
+    raxSeek(&it, "<=", (unsigned char *)prompt_text, prompt_bytes);
     int best = -1;
-    for (int i = 0; i < kc->len; i++) {
-        ds4_kvstore_entry *e = &kc->entry[i];
-        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
-        if ((int)e->tokens < kc->opt.min_tokens) continue;
-        if (e->model_id != (uint8_t)model_id) continue;
-        if ((uint32_t)ctx_size < e->ctx_size) continue;
-        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
-        if (best >= 0) {
-            ds4_kvstore_entry *b = &kc->entry[best];
-            if (e->text_bytes < b->text_bytes) continue;
-            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
+    while (!raxEOF(&it)) {
+        if (it.key_len <= prompt_bytes &&
+            ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
+                                          (const char *)it.key, it.key_len)) {
+            uintptr_t val = (uintptr_t)it.data;
+            if (val > 0 && val <= (uintptr_t)kc->len) {
+                int idx = (int)(val - 1);
+                ds4_kvstore_entry *e = &kc->entry[idx];
+                if ((int)e->tokens >= kc->opt.min_tokens &&
+                    e->model_id == (uint8_t)model_id &&
+                    (uint32_t)ctx_size >= e->ctx_size &&
+                    (!kc->reject_different_quant || e->quant_bits == (uint8_t)quant_bits))
+                {
+                    best = idx;
+                    break;
+                }
+            }
         }
-        char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (!strcmp(sha, e->sha)) best = i;
+        raxPrev(&it);
     }
+    raxStop(&it);
     return best;
 }
 

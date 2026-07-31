@@ -16618,6 +16618,65 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_rax_tree_branching_lookup(void) {
+    char tmpl[] = "/tmp/ds4-kv-rax-branching-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *root_text = "system prompt root prefix";
+    const char *branch_a = "system prompt root prefix continuation branch A";
+    const char *branch_b = "system prompt root prefix continuation branch B";
+    test_kv_text_stub_file(dir, root_text, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file(dir, branch_a, KV_REASON_CONTINUED, 1024, 0);
+    test_kv_text_stub_file(dir, branch_b, KV_REASON_CONTINUED, 1024, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* Query for branch A with tail */
+    int idx_a = kv_cache_find_text_prefix(&kc,
+        "system prompt root prefix continuation branch A and new tail",
+        2, 32768);
+    TEST_ASSERT(idx_a >= 0 && kc.entry[idx_a].tokens == 1024);
+    TEST_ASSERT(idx_a >= 0 && kc.entry[idx_a].text_bytes == strlen(branch_a));
+
+    /* Query for branch C (diverging after root) */
+    int idx_c = kv_cache_find_text_prefix(&kc,
+        "system prompt root prefix continuation branch C and new tail",
+        2, 32768);
+    TEST_ASSERT(idx_c >= 0 && kc.entry[idx_c].tokens == 512);
+    TEST_ASSERT(idx_c >= 0 && kc.entry[idx_c].text_bytes == strlen(root_text));
+
+    /* Query for unrelated prompt */
+    int idx_none = kv_cache_find_text_prefix(&kc,
+        "entirely unrelated prompt text",
+        2, 32768);
+    TEST_ASSERT(idx_none < 0);
+
+    kv_cache_close(&kc);
+    char root_sha[41], a_sha[41], b_sha[41];
+    sha1_bytes_hex(root_text, strlen(root_text), root_sha);
+    sha1_bytes_hex(branch_a, strlen(branch_a), a_sha);
+    sha1_bytes_hex(branch_b, strlen(branch_b), b_sha);
+    char name_root[44], name_a[44], name_b[44];
+    snprintf(name_root, sizeof(name_root), "%.40s.kv", root_sha);
+    snprintf(name_a, sizeof(name_a), "%.40s.kv", a_sha);
+    snprintf(name_b, sizeof(name_b), "%.40s.kv", b_sha);
+    char *path_root = path_join(dir, name_root);
+    char *path_a = path_join(dir, name_a);
+    char *path_b = path_join(dir, name_b);
+    unlink(path_root);
+    unlink(path_a);
+    unlink(path_b);
+    free(path_root);
+    free(path_a);
+    free(path_b);
+    rmdir(dir);
+}
+
 static void test_kv_cache_lookup_rejects_wrong_model(void) {
     char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -17511,6 +17570,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_rax_tree_branching_lookup();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();

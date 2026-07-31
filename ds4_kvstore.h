@@ -2,6 +2,7 @@
 #define DS4_KVSTORE_H
 
 #include "ds4.h"
+#include "rax.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -40,6 +41,7 @@ typedef struct {
      * incoming prompt?" */
     char sha[41];
     char *path;
+    char *text;
     uint8_t quant_bits;
     /* Stored in header byte 7.  Flash is 0 for backward compatibility with
      * older cache files where this reserved byte was always written as zero. */
@@ -74,6 +76,7 @@ typedef struct {
     ds4_kvstore_entry *entry;
     int len;
     int cap;
+    struct rax *prefix_tree;
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
