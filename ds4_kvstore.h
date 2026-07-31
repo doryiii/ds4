@@ -58,6 +58,7 @@ typedef struct {
     uint64_t payload_bytes;
     uint64_t text_bytes;
     uint64_t file_size;
+    uint32_t refcount;
 } ds4_kvstore_entry;
 
 #define DS4_KVBLOCK_MAGIC "KVB4"
@@ -154,6 +155,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
+void ds4_kvstore_recompute_refcounts(ds4_kvstore *kc);
 
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,

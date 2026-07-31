@@ -398,6 +398,8 @@ void ds4_kvstore_clear(ds4_kvstore *kc) {
     }
 }
 
+static int ds4_kvstore_find_by_sha(ds4_kvstore *kc, const char *sha);
+
 static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
     if (kc->len == kc->cap) {
         kc->cap = kc->cap ? kc->cap * 2 : 16;
@@ -405,6 +407,12 @@ static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
     }
     if (!kc->prefix_tree) kc->prefix_tree = raxNew();
     kc->entry[kc->len++] = e;
+    if (e.parent_sha[0] != '\0') {
+        int parent_idx = ds4_kvstore_find_by_sha(kc, e.parent_sha);
+        if (parent_idx >= 0) {
+            kc->entry[parent_idx].refcount++;
+        }
+    }
     if (e.text && e.text_bytes > 0) {
         void *old = NULL;
         raxInsert(kc->prefix_tree, (unsigned char *)e.text, (size_t)e.text_bytes,
@@ -681,6 +689,7 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         free(path);
     }
     closedir(d);
+    ds4_kvstore_recompute_refcounts(kc);
 }
 
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
@@ -783,20 +792,21 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     if (!kc->enabled || kc->budget_bytes == 0) return;
     if (extra_bytes > kc->budget_bytes) return;
     kv_cache_refresh(kc);
+    ds4_kvstore_recompute_refcounts(kc);
     const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 1e300;
+        for (int i = 0; i < kc->len; i++) {
+            if (kc->entry[i].refcount > 0) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 ||
+                score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -804,6 +814,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+        if (victim < 0) break;
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -822,6 +833,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         memmove(kc->entry + victim, kc->entry + victim + 1,
                 (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
+        ds4_kvstore_recompute_refcounts(kc);
     }
 }
 
@@ -1145,6 +1157,21 @@ static int ds4_kvstore_find_by_sha(ds4_kvstore *kc, const char *sha) {
         if (strcmp(kc->entry[i].sha, sha) == 0) return i;
     }
     return -1;
+}
+
+void ds4_kvstore_recompute_refcounts(ds4_kvstore *kc) {
+    if (!kc) return;
+    for (int i = 0; i < kc->len; i++) {
+        kc->entry[i].refcount = 0;
+    }
+    for (int i = 0; i < kc->len; i++) {
+        if (kc->entry[i].parent_sha[0] != '\0') {
+            int parent_idx = ds4_kvstore_find_by_sha(kc, kc->entry[i].parent_sha);
+            if (parent_idx >= 0) {
+                kc->entry[parent_idx].refcount++;
+            }
+        }
+    }
 }
 
 static int ds4_kvstore_try_load_block_chain_text(ds4_kvstore *kc,

@@ -17414,6 +17414,108 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     rmdir(dir);
 }
 
+static void test_kv_block_stub_file(const char *dir, const char *sha, const char *parent_sha,
+                                    uint32_t start_token, uint32_t end_token,
+                                    uint64_t payload_bytes, uint64_t last_used) {
+    char name[64];
+    snprintf(name, sizeof(name), "block_%.40s.kvb", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) {
+        free(path);
+        return;
+    }
+    ds4_kvstore_block_entry be = {0};
+    snprintf(be.sha, sizeof(be.sha), "%s", sha);
+    if (parent_sha && parent_sha[0]) {
+        snprintf(be.parent_sha, sizeof(be.parent_sha), "%s", parent_sha);
+    }
+    be.start_token = start_token;
+    be.end_token = end_token;
+    be.model_id = 1;
+    be.quant_bits = 4;
+    be.reason = DS4_KVSTORE_REASON_CONTINUED;
+    be.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+    be.ctx_size = 32768;
+    be.created_at = 1000ull;
+    be.last_used = last_used;
+    be.payload_bytes = payload_bytes;
+    be.text_bytes = 4;
+    uint8_t h[DS4_KVBLOCK_FIXED_HEADER];
+    ds4_kvstore_block_fill_header(h, &be);
+    fwrite(h, 1, sizeof(h), fp);
+    fwrite("test", 1, 4, fp);
+    for (uint64_t i = 0; i < payload_bytes; i++) fputc(0, fp);
+    fclose(fp);
+    free(path);
+}
+
+static void test_kv_cache_eviction_protects_shared_parent_blocks(void) {
+    char tmpl[] = "/tmp/ds4-kvb-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    char sha0[] = "0000000000000000000000000000000000000000";
+    char sha1A[] = "1111111111111111111111111111111111111111";
+    char sha1B[] = "2222222222222222222222222222222222222222";
+
+    test_kv_block_stub_file(dir, sha0, "", 0, 2048, 1024, 1000ull);
+    test_kv_block_stub_file(dir, sha1A, sha0, 2048, 4096, 1024, 1100ull);
+    test_kv_block_stub_file(dir, sha1B, sha0, 2048, 4096, 1024, 1200ull);
+
+    ds4_kvstore kc = {0};
+    TEST_ASSERT(ds4_kvstore_open(&kc, dir, 100, false,
+                                 ds4_kvstore_default_options(),
+                                 "test", NULL, NULL));
+    TEST_ASSERT(kc.len == 3);
+
+    int p0_idx = -1;
+    for (int i = 0; i < kc.len; i++) {
+        if (strcmp(kc.entry[i].sha, sha0) == 0) p0_idx = i;
+    }
+    TEST_ASSERT(p0_idx >= 0);
+    TEST_ASSERT(kc.entry[p0_idx].refcount == 2);
+
+    /* Force eviction: set budget so that only 2 blocks fit, evicting 1 block */
+    kc.budget_bytes = 2600;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(kc.len == 2);
+
+    /* Verify sha1A (oldest leaf) was evicted, while sha0 (parent) and sha1B remain */
+    bool found_0 = false, found_1B = false, found_1A = false;
+    for (int i = 0; i < kc.len; i++) {
+        if (strcmp(kc.entry[i].sha, sha0) == 0) {
+            found_0 = true;
+            TEST_ASSERT(kc.entry[i].refcount == 1);
+        }
+        if (strcmp(kc.entry[i].sha, sha1B) == 0) {
+            found_1B = true;
+            TEST_ASSERT(kc.entry[i].refcount == 0);
+        }
+        if (strcmp(kc.entry[i].sha, sha1A) == 0) found_1A = true;
+    }
+    TEST_ASSERT(found_0);
+    TEST_ASSERT(found_1B);
+    TEST_ASSERT(!found_1A);
+
+    /* Now force eviction so only 1 block fits: sha1B is evicted next, leaving sha0 */
+    kc.budget_bytes = 1400;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(kc.len == 1);
+    TEST_ASSERT(strcmp(kc.entry[0].sha, sha0) == 0);
+    TEST_ASSERT(kc.entry[0].refcount == 0);
+
+    /* Finally force eviction so 0 blocks fit: sha0 is now a leaf and gets evicted */
+    kc.budget_bytes = 100;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(kc.len == 0);
+
+    ds4_kvstore_close(&kc);
+    rmdir(dir);
+}
+
 static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     /* Simulate: user sends a single message, thinking mode on, no tools.
      * Model generates reasoning + content.  The next request will drop the
@@ -17791,6 +17893,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_protects_shared_parent_blocks();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
