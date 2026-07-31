@@ -1210,6 +1210,11 @@ static int ds4_kvstore_try_load_block_chain_text(ds4_kvstore *kc,
             open_ok = false;
             break;
         }
+        long offset = DS4_KVBLOCK_FIXED_HEADER + kc->entry[chain_indices[i]].text_bytes;
+        if (fseek(fps[i], offset, SEEK_SET) != 0) {
+            open_ok = false;
+            break;
+        }
     }
     int loaded = 0;
     char err[160] = {0};
