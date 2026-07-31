@@ -492,6 +492,115 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     return true;
 }
 
+void ds4_kvstore_block_entry_free(ds4_kvstore_block_entry *e) {
+    if (!e) return;
+    free(e->path);
+    memset(e, 0, sizeof(*e));
+}
+
+void ds4_kvstore_block_fill_header(uint8_t h[DS4_KVBLOCK_FIXED_HEADER],
+                                   const ds4_kvstore_block_entry *e) {
+    memset(h, 0, DS4_KVBLOCK_FIXED_HEADER);
+    memcpy(h, DS4_KVBLOCK_MAGIC, 4);
+    h[4] = DS4_KVBLOCK_VERSION;
+    h[5] = e->model_id;
+    h[6] = e->quant_bits;
+    h[7] = e->reason;
+    h[8] = e->cache_mode_flags;
+    h[9] = e->ext_flags;
+    h[10] = 0;
+    h[11] = 0;
+    ds4_kvstore_le_put32(h + 12, e->start_token);
+    ds4_kvstore_le_put32(h + 16, e->end_token);
+    ds4_kvstore_le_put32(h + 20, e->ctx_size);
+    kv_le_put64(h + 24, e->created_at);
+    kv_le_put64(h + 32, e->last_used);
+    kv_le_put64(h + 40, e->payload_bytes);
+    memcpy(h + 64, e->sha, 40);
+    if (e->start_token > 0 && e->parent_sha[0]) {
+        memcpy(h + 104, e->parent_sha, 40);
+    } else {
+        memset(h + 104, '0', 40);
+    }
+}
+
+bool ds4_kvstore_block_read_header(FILE *fp, ds4_kvstore_block_entry *e) {
+    uint8_t h[DS4_KVBLOCK_FIXED_HEADER];
+    if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
+    if (memcmp(h, DS4_KVBLOCK_MAGIC, 4) != 0) return false;
+    if (h[4] != DS4_KVBLOCK_VERSION) return false;
+    memset(e, 0, sizeof(*e));
+    e->model_id = h[5];
+    e->quant_bits = h[6];
+    e->reason = h[7];
+    e->cache_mode_flags = h[8];
+    e->ext_flags = h[9];
+    e->start_token = ds4_kvstore_le_get32(h + 12);
+    e->end_token = ds4_kvstore_le_get32(h + 16);
+    e->ctx_size = ds4_kvstore_le_get32(h + 20);
+    e->created_at = kv_le_get64(h + 24);
+    e->last_used = kv_le_get64(h + 32);
+    e->payload_bytes = kv_le_get64(h + 40);
+    memcpy(e->sha, h + 64, 40);
+    e->sha[40] = '\0';
+    memcpy(e->parent_sha, h + 104, 40);
+    e->parent_sha[40] = '\0';
+    if (e->end_token <= e->start_token) return false;
+    if (e->start_token == 0) {
+        e->parent_sha[0] = '\0';
+    }
+    return (e->quant_bits == 2 || e->quant_bits == 4);
+}
+
+bool ds4_kvstore_block_read_entry_file(const char *path, const char sha[41],
+                                       ds4_kvstore_block_entry *out) {
+    struct stat st;
+    if (stat(path, &st) != 0 ||
+        st.st_size < (off_t)DS4_KVBLOCK_FIXED_HEADER)
+        return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    ds4_kvstore_block_entry e = {0};
+    bool ok = ds4_kvstore_block_read_header(fp, &e);
+    fclose(fp);
+    if (!ok) return false;
+    if (UINT64_MAX - DS4_KVBLOCK_FIXED_HEADER < e.payload_bytes)
+        return false;
+    const uint64_t expected = DS4_KVBLOCK_FIXED_HEADER + e.payload_bytes;
+    if ((uint64_t)st.st_size < expected) return false;
+    if (sha && sha[0]) {
+        if (strcmp(e.sha, sha) != 0) return false;
+    }
+    e.path = kv_xstrdup(path);
+    e.file_size = (uint64_t)st.st_size;
+    *out = e;
+    return true;
+}
+
+bool ds4_kvstore_verify_block_chain(const ds4_kvstore_block_entry *const *chain,
+                                    int count) {
+    if (!chain || count <= 0) return false;
+    if (!chain[0]) return false;
+    if (chain[0]->start_token != 0) return false;
+    if (chain[0]->parent_sha[0] != '\0') return false;
+    if (chain[0]->end_token <= chain[0]->start_token) return false;
+
+    for (int i = 1; i < count; i++) {
+        const ds4_kvstore_block_entry *prev = chain[i - 1];
+        const ds4_kvstore_block_entry *curr = chain[i];
+        if (!curr || !prev) return false;
+        if (curr->start_token != prev->end_token) return false;
+        if (curr->end_token <= curr->start_token) return false;
+        if (strcmp(curr->parent_sha, prev->sha) != 0) return false;
+        if (curr->model_id != chain[0]->model_id) return false;
+        if (curr->quant_bits != chain[0]->quant_bits) return false;
+        if (curr->cache_mode_flags != chain[0]->cache_mode_flags) return false;
+        if (curr->ctx_size != chain[0]->ctx_size) return false;
+    }
+    return true;
+}
+
+
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);

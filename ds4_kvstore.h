@@ -58,6 +58,33 @@ typedef struct {
     uint64_t file_size;
 } ds4_kvstore_entry;
 
+#define DS4_KVBLOCK_MAGIC "KVB4"
+#define DS4_KVBLOCK_VERSION 1u
+#define DS4_KVBLOCK_FIXED_HEADER 144u
+
+#define DS4_KVBLOCK_MODE_GLM          (1u << 0)
+#define DS4_KVBLOCK_MODE_GLM_COMPACT  (1u << 1)
+#define DS4_KVBLOCK_MODE_GLM_INDEXER  (1u << 2)
+
+typedef struct ds4_kvstore_block_entry {
+    char sha[41];
+    char parent_sha[41];
+    char *path;
+    uint8_t quant_bits;
+    uint8_t model_id;
+    uint8_t reason;
+    uint8_t cache_mode_flags;
+    uint8_t ext_flags;
+    uint32_t start_token;
+    uint32_t end_token;
+    uint32_t ctx_size;
+    uint64_t created_at;
+    uint64_t last_used;
+    uint64_t payload_bytes;
+    uint64_t file_size;
+    uint32_t refcount;
+} ds4_kvstore_block_entry;
+
 typedef struct {
     int min_tokens;
     int cold_max_tokens;
@@ -217,5 +244,14 @@ char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
+
+void ds4_kvstore_block_entry_free(ds4_kvstore_block_entry *e);
+void ds4_kvstore_block_fill_header(uint8_t h[DS4_KVBLOCK_FIXED_HEADER],
+                                   const ds4_kvstore_block_entry *e);
+bool ds4_kvstore_block_read_header(FILE *fp, ds4_kvstore_block_entry *e);
+bool ds4_kvstore_block_read_entry_file(const char *path, const char sha[41],
+                                       ds4_kvstore_block_entry *out);
+bool ds4_kvstore_verify_block_chain(const ds4_kvstore_block_entry *const *chain,
+                                    int count);
 
 #endif

@@ -16677,6 +16677,112 @@ static void test_kv_cache_rax_tree_branching_lookup(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_block_header_serialization(void) {
+    char tmpl[] = "/tmp/ds4-kvb-hdr-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    ds4_kvstore_block_entry e = {0};
+    snprintf(e.sha, sizeof(e.sha), "1111111111111111111111111111111111111111");
+    snprintf(e.parent_sha, sizeof(e.parent_sha), "0000000000000000000000000000000000000000");
+    e.model_id = 2;
+    e.quant_bits = 4;
+    e.reason = DS4_KVSTORE_REASON_CONTINUED;
+    e.cache_mode_flags = DS4_KVBLOCK_MODE_GLM | DS4_KVBLOCK_MODE_GLM_COMPACT;
+    e.start_token = 2048;
+    e.end_token = 4096;
+    e.ctx_size = 32768;
+    e.created_at = 1234567890ull;
+    e.last_used = 1234567999ull;
+    e.payload_bytes = 1048576ull;
+
+    uint8_t hdr_bytes[DS4_KVBLOCK_FIXED_HEADER];
+    ds4_kvstore_block_fill_header(hdr_bytes, &e);
+
+    char *path = path_join(dir, "test_block.kvb");
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fwrite(hdr_bytes, 1, sizeof(hdr_bytes), fp);
+        fclose(fp);
+    }
+
+    fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        ds4_kvstore_block_entry in = {0};
+        bool ok = ds4_kvstore_block_read_header(fp, &in);
+        fclose(fp);
+        TEST_ASSERT(ok);
+        TEST_ASSERT(in.model_id == 2);
+        TEST_ASSERT(in.quant_bits == 4);
+        TEST_ASSERT(in.reason == DS4_KVSTORE_REASON_CONTINUED);
+        TEST_ASSERT(in.cache_mode_flags == (DS4_KVBLOCK_MODE_GLM | DS4_KVBLOCK_MODE_GLM_COMPACT));
+        TEST_ASSERT(in.start_token == 2048 && in.end_token == 4096);
+        TEST_ASSERT(in.ctx_size == 32768);
+        TEST_ASSERT(in.created_at == 1234567890ull && in.last_used == 1234567999ull);
+        TEST_ASSERT(in.payload_bytes == 1048576ull);
+        TEST_ASSERT(strcmp(in.sha, e.sha) == 0);
+        TEST_ASSERT(strcmp(in.parent_sha, e.parent_sha) == 0);
+    }
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_block_chain_verification(void) {
+    ds4_kvstore_block_entry b0 = {0}, b1 = {0}, b2 = {0};
+    snprintf(b0.sha, sizeof(b0.sha), "1111111111111111111111111111111111111111");
+    b0.parent_sha[0] = '\0';
+    b0.start_token = 0;
+    b0.end_token = 2048;
+    b0.model_id = 1;
+    b0.quant_bits = 4;
+    b0.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+    b0.ctx_size = 32768;
+
+    snprintf(b1.sha, sizeof(b1.sha), "2222222222222222222222222222222222222222");
+    snprintf(b1.parent_sha, sizeof(b1.parent_sha), "1111111111111111111111111111111111111111");
+    b1.start_token = 2048;
+    b1.end_token = 4096;
+    b1.model_id = 1;
+    b1.quant_bits = 4;
+    b1.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+    b1.ctx_size = 32768;
+
+    snprintf(b2.sha, sizeof(b2.sha), "3333333333333333333333333333333333333333");
+    snprintf(b2.parent_sha, sizeof(b2.parent_sha), "2222222222222222222222222222222222222222");
+    b2.start_token = 4096;
+    b2.end_token = 6144;
+    b2.model_id = 1;
+    b2.quant_bits = 4;
+    b2.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+    b2.ctx_size = 32768;
+
+    const ds4_kvstore_block_entry *chain[3] = { &b0, &b1, &b2 };
+    TEST_ASSERT(ds4_kvstore_verify_block_chain(chain, 3) == true);
+
+    /* Break parent SHA link */
+    b1.parent_sha[0] = '9';
+    TEST_ASSERT(ds4_kvstore_verify_block_chain(chain, 3) == false);
+    snprintf(b1.parent_sha, sizeof(b1.parent_sha), "1111111111111111111111111111111111111111");
+
+    /* Break token continuity */
+    b1.start_token = 1024;
+    TEST_ASSERT(ds4_kvstore_verify_block_chain(chain, 3) == false);
+    b1.start_token = 2048;
+
+    /* Break GLM vs DeepSeek cache mode flag homogeneity */
+    b2.cache_mode_flags = 0;
+    TEST_ASSERT(ds4_kvstore_verify_block_chain(chain, 3) == false);
+    b2.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+
+    /* Break model ID homogeneity */
+    b2.model_id = 2;
+    TEST_ASSERT(ds4_kvstore_verify_block_chain(chain, 3) == false);
+}
+
 static void test_kv_cache_lookup_rejects_wrong_model(void) {
     char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -17571,6 +17677,8 @@ static void ds4_server_unit_tests_run(void) {
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_rax_tree_branching_lookup();
+    test_kv_cache_block_header_serialization();
+    test_kv_cache_block_chain_verification();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
