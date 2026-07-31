@@ -50562,6 +50562,319 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+static int payload_write_glm_block_span(FILE *fp, const ds4_gpu_tensor *t,
+                                        uint64_t start_row, uint64_t num_rows,
+                                        uint64_t row_elems, uint8_t *buf, size_t cap,
+                                        char *err, size_t errlen) {
+    if (!t || num_rows == 0) return 0;
+    const uint64_t offset_elems = start_row * row_elems;
+    const uint64_t count_elems = num_rows * row_elems;
+    if (glm_graph_compact_cache_is_f16()) {
+        return payload_write_tensor_span_f16_as_f32(fp, t, offset_elems * sizeof(uint16_t),
+                                                    count_elems, buf, cap, err, errlen);
+    }
+    return payload_write_tensor_span(fp, t, offset_elems * sizeof(float),
+                                     count_elems * sizeof(float), buf, cap, err, errlen);
+}
+
+static int payload_read_glm_block_span(FILE *fp, ds4_gpu_tensor *t,
+                                       uint64_t start_row, uint64_t num_rows,
+                                       uint64_t row_elems, uint8_t *buf, size_t cap,
+                                       uint64_t *rem, char *err, size_t errlen) {
+    if (!t || num_rows == 0) return 0;
+    const uint64_t offset_elems = start_row * row_elems;
+    const uint64_t count_elems = num_rows * row_elems;
+    if (glm_graph_compact_cache_is_f16()) {
+        return payload_read_tensor_span_f32_as_f16(fp, t, offset_elems * sizeof(uint16_t),
+                                                   count_elems, buf, cap, rem, err, errlen);
+    }
+    return payload_read_tensor_span(fp, t, offset_elems * sizeof(float),
+                                    count_elems * sizeof(float), buf, cap, rem, err, errlen);
+}
+#endif
+
+uint64_t ds4_session_block_payload_bytes(ds4_session *s, uint32_t start_token, uint32_t end_token) {
+    if (!s || !s->checkpoint_valid || end_token <= start_token ||
+        (end_token - start_token) % 2048 != 0) {
+        return 0;
+    }
+#ifdef DS4_NO_GPU
+    return 0;
+#else
+    const uint32_t block_rows = end_token - start_token;
+    uint64_t bytes = 16 * sizeof(uint32_t); /* Header */
+    bytes += (uint64_t)block_rows * sizeof(uint32_t); /* Token IDs */
+    if (ds4_session_is_glm(s)) {
+        ds4_glm_gpu_graph *g = &s->glm_graph;
+        for (uint32_t il = 0; il < g->normal_layers; il++) {
+            uint64_t lora_bytes = (uint64_t)block_rows * DS4_N_KV_LORA * (glm_graph_compact_cache_is_f16() ? sizeof(uint16_t) : sizeof(float));
+            uint64_t rope_bytes = (uint64_t)block_rows * DS4_N_ROT * (glm_graph_compact_cache_is_f16() ? sizeof(uint16_t) : sizeof(float));
+            bytes += lora_bytes + rope_bytes;
+            if (glm_graph_layer_uses_full_indexer(il)) {
+                bytes += (uint64_t)block_rows * DS4_N_INDEXER_HEAD_DIM * (glm_graph_compact_cache_is_f16() ? sizeof(uint16_t) : sizeof(float));
+            }
+        }
+        return bytes;
+    } else {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            uint64_t comp_rows = (uint64_t)block_rows / ratio;
+            bytes += comp_rows * DS4_N_HEAD_DIM * (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            bytes += comp_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        }
+        return bytes;
+    }
+#endif
+}
+
+int ds4_session_save_block_payload(ds4_session *s, FILE *fp,
+                                   uint32_t start_token, uint32_t end_token,
+                                   char *err, size_t errlen) {
+    if (!s || !fp || !s->checkpoint_valid || end_token <= start_token ||
+        (end_token - start_token) % 2048 != 0) {
+        payload_set_err(err, errlen, "invalid block token span");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)start_token; (void)end_token;
+    payload_set_err(err, errlen, "block payload save requires graph backend");
+    return 1;
+#else
+    const uint32_t block_rows = end_token - start_token;
+    uint32_t hdr[16] = {0};
+    hdr[0] = 0x42565344; /* "DSVB" magic */
+    hdr[1] = 1;          /* version */
+    hdr[2] = start_token;
+    hdr[3] = end_token;
+    hdr[4] = (uint32_t)s->ctx_size;
+    hdr[5] = block_rows;
+    if (ds4_session_is_glm(s)) {
+        ds4_glm_gpu_graph *g = &s->glm_graph;
+        if (!s->glm_graph_ready) {
+            payload_set_err(err, errlen, "GLM graph is not ready for block save");
+            return 1;
+        }
+        hdr[6] = 1; /* is_glm */
+        hdr[7] = g->normal_layers;
+        hdr[8] = DS4_N_KV_LORA;
+        hdr[9] = DS4_N_ROT;
+        hdr[10] = DS4_N_INDEXER_HEAD_DIM;
+        for (int i = 0; i < 16; i++) {
+            if (payload_write_u32(fp, hdr[i], err, errlen) != 0) return 1;
+        }
+        for (uint32_t i = start_token; i < end_token; i++) {
+            uint32_t tid = (uint32_t)s->checkpoint.v[i];
+            if (payload_write_u32(fp, tid, err, errlen) != 0) return 1;
+        }
+        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        int rc = 0;
+        for (uint32_t il = 0; rc == 0 && il < g->normal_layers; il++) {
+            rc = payload_write_glm_block_span(fp, g->layer_kv_lora_cache[il],
+                                              start_token, block_rows, DS4_N_KV_LORA,
+                                              buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) {
+                rc = payload_write_glm_block_span(fp, g->layer_k_rope_cache[il],
+                                                  start_token, block_rows, DS4_N_ROT,
+                                                  buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+            if (rc == 0 && glm_graph_layer_uses_full_indexer(il)) {
+                rc = payload_write_glm_block_span(fp, g->layer_indexer_key_cache[il],
+                                                  start_token, block_rows, DS4_N_INDEXER_HEAD_DIM,
+                                                  buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+        }
+        free(buf);
+        return rc;
+    } else {
+        const ds4_gpu_graph *g = &s->graph;
+        hdr[6] = 0; /* is_glm = false */
+        hdr[7] = DS4_N_LAYER;
+        hdr[8] = DS4_N_HEAD_DIM;
+        hdr[9] = DS4_N_INDEXER_HEAD_DIM;
+        for (int i = 0; i < 16; i++) {
+            if (payload_write_u32(fp, hdr[i], err, errlen) != 0) return 1;
+        }
+        for (uint32_t i = start_token; i < end_token; i++) {
+            uint32_t tid = (uint32_t)s->checkpoint.v[i];
+            if (payload_write_u32(fp, tid, err, errlen) != 0) return 1;
+        }
+        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        int rc = 0;
+        for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint32_t comp_start = start_token / ratio;
+            const uint32_t comp_rows = block_rows / ratio;
+            if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                rc = payload_write_tensor_span_f16_as_f32(
+                    fp, g->layer_attn_comp_cache[il],
+                    (uint64_t)comp_start * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                    (uint64_t)comp_rows * DS4_N_HEAD_DIM,
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            } else {
+                rc = payload_write_tensor_span(
+                    fp, g->layer_attn_comp_cache[il],
+                    (uint64_t)comp_start * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)comp_rows * DS4_N_HEAD_DIM * sizeof(float),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+            if (rc == 0) {
+                rc = payload_write_tensor_span(
+                    fp, g->layer_index_comp_cache[il],
+                    (uint64_t)comp_start * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                    (uint64_t)comp_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+        }
+        free(buf);
+        return rc;
+    }
+#endif
+}
+
+int ds4_session_load_block_chain(ds4_session *s, FILE **fps, uint32_t count,
+                                 char *err, size_t errlen) {
+    if (!s || !fps || count == 0) {
+        payload_set_err(err, errlen, "invalid block chain load");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    payload_set_err(err, errlen, "block chain load requires graph backend");
+    return 1;
+#else
+    uint32_t total_tokens = 0;
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    token_vec new_checkpoint = {0};
+    for (uint32_t b = 0; rc == 0 && b < count; b++) {
+        FILE *fp = fps[b];
+        if (!fp) {
+            payload_set_err(err, errlen, "null block file in chain");
+            rc = 1;
+            break;
+        }
+        uint32_t hdr[16] = {0};
+        uint64_t remaining = UINT64_MAX;
+        for (int i = 0; i < 16; i++) {
+            if (payload_read_u32(fp, &hdr[i], &remaining, err, errlen) != 0) {
+                rc = 1;
+                break;
+            }
+        }
+        if (rc != 0) break;
+        if (hdr[0] != 0x42565344 || hdr[1] != 1) {
+            payload_set_err(err, errlen, "invalid block magic or version");
+            rc = 1;
+            break;
+        }
+        const uint32_t start_token = hdr[2];
+        const uint32_t end_token = hdr[3];
+        const uint32_t block_rows = hdr[5];
+        if (start_token != total_tokens || end_token <= start_token ||
+            block_rows != (end_token - start_token)) {
+            payload_set_err(err, errlen, "discontinuous tokens in block chain");
+            rc = 1;
+            break;
+        }
+        for (uint32_t i = 0; rc == 0 && i < block_rows; i++) {
+            uint32_t tid = 0;
+            if (payload_read_u32(fp, &tid, &remaining, err, errlen) != 0) {
+                rc = 1;
+                break;
+            }
+            if (tid >= DS4_N_VOCAB) {
+                payload_set_err(err, errlen, "block token is outside vocabulary");
+                rc = 1;
+                break;
+            }
+            token_vec_push(&new_checkpoint, (int)tid);
+        }
+        if (rc != 0) break;
+
+        if (ds4_session_is_glm(s)) {
+            ds4_glm_gpu_graph *g = &s->glm_graph;
+            if (hdr[6] != 1 || hdr[7] != g->normal_layers) {
+                payload_set_err(err, errlen, "block layout mismatch for GLM");
+                rc = 1;
+                break;
+            }
+            for (uint32_t il = 0; rc == 0 && il < g->normal_layers; il++) {
+                rc = payload_read_glm_block_span(fp, g->layer_kv_lora_cache[il],
+                                                 start_token, block_rows, DS4_N_KV_LORA,
+                                                 buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                if (rc == 0) {
+                    rc = payload_read_glm_block_span(fp, g->layer_k_rope_cache[il],
+                                                     start_token, block_rows, DS4_N_ROT,
+                                                     buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                }
+                if (rc == 0 && glm_graph_layer_uses_full_indexer(il)) {
+                    rc = payload_read_glm_block_span(fp, g->layer_indexer_key_cache[il],
+                                                     start_token, block_rows, DS4_N_INDEXER_HEAD_DIM,
+                                                     buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                }
+            }
+        } else {
+            const ds4_gpu_graph *g = &s->graph;
+            if (hdr[6] != 0 || hdr[7] != DS4_N_LAYER) {
+                payload_set_err(err, errlen, "block layout mismatch for DeepSeek V4");
+                rc = 1;
+                break;
+            }
+            for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+                const uint32_t ratio = ds4_layer_compress_ratio(il);
+                if (ratio == 0) continue;
+                const uint32_t comp_start = start_token / ratio;
+                const uint32_t comp_rows = block_rows / ratio;
+                if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                    rc = payload_read_tensor_span_f32_as_f16(
+                        fp, g->layer_attn_comp_cache[il],
+                        (uint64_t)comp_start * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                        (uint64_t)comp_rows * DS4_N_HEAD_DIM,
+                        buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                } else {
+                    rc = payload_read_tensor_span(
+                        fp, g->layer_attn_comp_cache[il],
+                        (uint64_t)comp_start * DS4_N_HEAD_DIM * sizeof(float),
+                        (uint64_t)comp_rows * DS4_N_HEAD_DIM * sizeof(float),
+                        buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                }
+                if (rc == 0) {
+                    rc = payload_read_tensor_span(
+                        fp, g->layer_index_comp_cache[il],
+                        (uint64_t)comp_start * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        (uint64_t)comp_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                }
+            }
+        }
+        if (rc == 0) {
+            total_tokens = end_token;
+        }
+    }
+    free(buf);
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "failed to synchronize accelerator after block chain restore");
+        return 1;
+    }
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_invalidate(s);
+    if (!ds4_session_is_glm(s)) {
+        s->graph.mtp_n_raw = 0;
+    }
+    return 0;
+#endif
+}
+
 void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
     if (!snap) return;
     free(snap->ptr);

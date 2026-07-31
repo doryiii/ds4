@@ -328,10 +328,21 @@ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
 }
 
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
-    if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
+    if (!name) return false;
+    size_t len = strlen(name);
+    const char *hex = NULL;
+    if (len == 43 && strcmp(name + 40, ".kv") == 0) {
+        hex = name;
+    } else if (len == 44 && strcmp(name + 40, ".kvb") == 0) {
+        hex = name;
+    } else if (len == 50 && strncmp(name, "block_", 6) == 0 && strcmp(name + 46, ".kvb") == 0) {
+        hex = name + 6;
+    } else {
+        return false;
+    }
     for (int i = 0; i < 40; i++) {
-        if (!isxdigit((unsigned char)name[i])) return false;
-        sha[i] = (char)tolower((unsigned char)name[i]);
+        if (!isxdigit((unsigned char)hex[i])) return false;
+        sha[i] = (char)tolower((unsigned char)hex[i]);
     }
     sha[40] = '\0';
     return true;
@@ -452,6 +463,34 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out) {
+    if (!path || !sha || !out) return false;
+    size_t plen = strlen(path);
+    if (plen >= 4 && strcmp(path + plen - 4, ".kvb") == 0) {
+        ds4_kvstore_block_entry be = {0};
+        if (!ds4_kvstore_block_read_entry_file(path, sha, &be)) {
+            return false;
+        }
+        ds4_kvstore_entry e = {0};
+        e.quant_bits = be.quant_bits;
+        e.model_id = be.model_id;
+        e.reason = be.reason;
+        e.tokens = be.end_token;
+        e.hits = be.hits;
+        e.ctx_size = be.ctx_size;
+        e.ext_flags = be.ext_flags;
+        e.created_at = be.created_at;
+        e.last_used = be.last_used;
+        e.payload_bytes = be.payload_bytes;
+        e.text_bytes = be.text_bytes;
+        e.file_size = be.file_size;
+        e.start_token = be.start_token;
+        memcpy(e.parent_sha, be.parent_sha, 41);
+        e.text = be.text;
+        memcpy(e.sha, sha, 41);
+        e.path = kv_xstrdup(path);
+        *out = e;
+        return true;
+    }
     struct stat st;
     if (stat(path, &st) != 0 ||
         st.st_size < (off_t)(DS4_KVSTORE_FIXED_HEADER + 4))
@@ -495,6 +534,7 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 void ds4_kvstore_block_entry_free(ds4_kvstore_block_entry *e) {
     if (!e) return;
     free(e->path);
+    free(e->text);
     memset(e, 0, sizeof(*e));
 }
 
@@ -516,6 +556,8 @@ void ds4_kvstore_block_fill_header(uint8_t h[DS4_KVBLOCK_FIXED_HEADER],
     kv_le_put64(h + 24, e->created_at);
     kv_le_put64(h + 32, e->last_used);
     kv_le_put64(h + 40, e->payload_bytes);
+    ds4_kvstore_le_put32(h + 48, e->text_bytes);
+    ds4_kvstore_le_put32(h + 52, e->hits);
     memcpy(h + 64, e->sha, 40);
     if (e->start_token > 0 && e->parent_sha[0]) {
         memcpy(h + 104, e->parent_sha, 40);
@@ -541,6 +583,8 @@ bool ds4_kvstore_block_read_header(FILE *fp, ds4_kvstore_block_entry *e) {
     e->created_at = kv_le_get64(h + 24);
     e->last_used = kv_le_get64(h + 32);
     e->payload_bytes = kv_le_get64(h + 40);
+    e->text_bytes = ds4_kvstore_le_get32(h + 48);
+    e->hits = ds4_kvstore_le_get32(h + 52);
     memcpy(e->sha, h + 64, 40);
     e->sha[40] = '\0';
     memcpy(e->parent_sha, h + 104, 40);
@@ -562,14 +606,35 @@ bool ds4_kvstore_block_read_entry_file(const char *path, const char sha[41],
     if (!fp) return false;
     ds4_kvstore_block_entry e = {0};
     bool ok = ds4_kvstore_block_read_header(fp, &e);
-    fclose(fp);
-    if (!ok) return false;
-    if (UINT64_MAX - DS4_KVBLOCK_FIXED_HEADER < e.payload_bytes)
+    if (!ok) {
+        fclose(fp);
         return false;
-    const uint64_t expected = DS4_KVBLOCK_FIXED_HEADER + e.payload_bytes;
-    if ((uint64_t)st.st_size < expected) return false;
+    }
+    if (UINT64_MAX - DS4_KVBLOCK_FIXED_HEADER - (uint64_t)e.text_bytes < e.payload_bytes)
+    {
+        fclose(fp);
+        return false;
+    }
+    const uint64_t expected = DS4_KVBLOCK_FIXED_HEADER + (uint64_t)e.text_bytes + e.payload_bytes;
+    if ((uint64_t)st.st_size < expected) {
+        fclose(fp);
+        return false;
+    }
+    if (e.text_bytes > 0) {
+        e.text = kv_xmalloc((size_t)e.text_bytes + 1);
+        if (fread(e.text, 1, e.text_bytes, fp) != e.text_bytes) {
+            free(e.text);
+            fclose(fp);
+            return false;
+        }
+        e.text[e.text_bytes] = '\0';
+    }
+    fclose(fp);
     if (sha && sha[0]) {
-        if (strcmp(e.sha, sha) != 0) return false;
+        if (strcmp(e.sha, sha) != 0) {
+            free(e.text);
+            return false;
+        }
     }
     e.path = kv_xstrdup(path);
     e.file_size = (uint64_t)st.st_size;
@@ -619,6 +684,24 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
 }
 
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
+    if (!path) return false;
+    size_t plen = strlen(path);
+    if (plen >= 4 && strcmp(path + plen - 4, ".kvb") == 0) {
+        FILE *fp = fopen(path, "r+b");
+        if (!fp) return false;
+        ds4_kvstore_block_entry be = {0};
+        bool ok = ds4_kvstore_block_read_header(fp, &be);
+        if (ok) {
+            be.hits = hits;
+            be.last_used = (uint64_t)time(NULL);
+            uint8_t h[DS4_KVBLOCK_FIXED_HEADER];
+            ds4_kvstore_block_fill_header(h, &be);
+            ok = fseek(fp, 0, SEEK_SET) == 0 &&
+                 fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+        }
+        fclose(fp);
+        return ok;
+    }
     FILE *fp = fopen(path, "r+b");
     if (!fp) return false;
     ds4_kvstore_entry e = {0};
@@ -1056,6 +1139,220 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
+static int ds4_kvstore_find_by_sha(ds4_kvstore *kc, const char *sha) {
+    if (!kc || !sha || !sha[0]) return -1;
+    for (int i = 0; i < kc->len; i++) {
+        if (strcmp(kc->entry[i].sha, sha) == 0) return i;
+    }
+    return -1;
+}
+
+static int ds4_kvstore_try_load_block_chain_text(ds4_kvstore *kc,
+                                                 ds4_engine *engine,
+                                                 ds4_session *session,
+                                                 const char *prompt_text,
+                                                 ds4_tokens *effective_prompt,
+                                                 ds4_kvstore_load_result *result,
+                                                 const ds4_kvstore_trailer_hooks *hooks,
+                                                 bool responses_protocol,
+                                                 int idx) {
+    (void)hooks;
+    (void)responses_protocol;
+    if (idx < 0 || idx >= kc->len) return 0;
+    int chain_indices[64];
+    int count = 0;
+    int curr = idx;
+    while (curr >= 0 && count < 64) {
+        chain_indices[count++] = curr;
+        if (kc->entry[curr].start_token == 0) break;
+        curr = ds4_kvstore_find_by_sha(kc, kc->entry[curr].parent_sha);
+    }
+    if (count == 0 || kc->entry[chain_indices[count - 1]].start_token != 0) {
+        return 0;
+    }
+    for (int i = 0; i < count / 2; i++) {
+        int tmp = chain_indices[i];
+        chain_indices[i] = chain_indices[count - 1 - i];
+        chain_indices[count - 1 - i] = tmp;
+    }
+    FILE *fps[64] = {0};
+    bool open_ok = true;
+    for (int i = 0; i < count; i++) {
+        fps[i] = fopen(kc->entry[chain_indices[i]].path, "rb");
+        if (!fps[i]) {
+            open_ok = false;
+            break;
+        }
+    }
+    int loaded = 0;
+    char err[160] = {0};
+    if (open_ok && ds4_session_load_block_chain(session, fps, (uint32_t)count, err, sizeof(err)) == 0) {
+        loaded = count * 2048;
+        ds4_kvstore_entry e_leaf = kc->entry[idx];
+        if (effective_prompt) {
+            const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
+            if (loaded_tokens && loaded_tokens->len == loaded) {
+                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                    engine, loaded_tokens, prompt_text + e_leaf.text_bytes,
+                    effective_prompt);
+            }
+        }
+        for (int i = 0; i < count; i++) {
+            kc->entry[chain_indices[i]].hits++;
+            kc->entry[chain_indices[i]].last_used = (uint64_t)time(NULL);
+            ds4_kvstore_touch_file(kc->entry[chain_indices[i]].path, kc->entry[chain_indices[i]].hits);
+        }
+        if (result) {
+            result->tokens = loaded;
+            result->text_bytes = (uint32_t)e_leaf.text_bytes;
+            result->quant_bits = e_leaf.quant_bits;
+            result->ext_flags = e_leaf.ext_flags;
+            result->path = kv_xstrdup(e_leaf.path);
+        }
+    } else {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache failed to load %d block chain (%s): %s",
+                kv_log_name(kc), count, kc->entry[chain_indices[count - 1]].path,
+                !open_ok ? "failed to open block file in chain" :
+                (err[0] ? err : "unknown error"));
+        ds4_session_invalidate(session);
+    }
+    for (int i = 0; i < count; i++) {
+        if (fps[i]) fclose(fps[i]);
+    }
+    return loaded;
+}
+
+static bool ds4_kvstore_store_block_chain_text(ds4_kvstore *kc,
+                                               ds4_engine *engine,
+                                               ds4_session *session,
+                                               const ds4_tokens *store_tokens,
+                                               const char *reason,
+                                               const ds4_kvstore_trailer_hooks *hooks,
+                                               char *err,
+                                               size_t err_len) {
+    (void)hooks;
+    const int model_id = ds4_engine_model_id(engine);
+    const int quant_bits = ds4_engine_routed_quant_bits(engine);
+    uint32_t num_blocks = store_tokens->len / 2048;
+    if (num_blocks == 0) return false;
+
+    char parent_sha[41] = {0};
+    bool any_written = false;
+
+    for (uint32_t i = 0; i < num_blocks; i++) {
+        uint32_t start_tok = i * 2048;
+        uint32_t end_tok = (i + 1) * 2048;
+
+        ds4_tokens slice = {0};
+        ds4_kvstore_tokens_copy_prefix(&slice, store_tokens, (int)end_tok);
+        size_t text_len = 0;
+        char *text = ds4_kvstore_render_tokens_text(engine, &slice, &text_len);
+        ds4_tokens_free(&slice);
+        if (!text) {
+            if (err && err_len > 0) snprintf(err, err_len, "render_tokens_text failed");
+            return false;
+        }
+
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+
+        if (ds4_kvstore_find_by_sha(kc, sha) >= 0) {
+            memcpy(parent_sha, sha, 41);
+            free(text);
+            continue;
+        }
+
+        char name_buf[64];
+        snprintf(name_buf, sizeof(name_buf), "block_%s.kvb", sha);
+        char *kvb_path = ds4_kvstore_path_join(kc->dir, name_buf);
+
+        char tmp_path[1024];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", kvb_path, (int)getpid());
+
+        FILE *fp = fopen(tmp_path, "wb");
+        if (!fp) {
+            if (err && err_len > 0) snprintf(err, err_len, "fopen tmp failed: %s", tmp_path);
+            free(kvb_path);
+            free(text);
+            return false;
+        }
+
+        ds4_kvstore_block_entry be = {0};
+        be.model_id = (uint8_t)model_id;
+        be.quant_bits = (uint8_t)quant_bits;
+        be.reason = ds4_kvstore_reason_code(reason);
+        be.start_token = start_tok;
+        be.end_token = end_tok;
+        be.ctx_size = (uint32_t)ds4_session_ctx(session);
+        be.created_at = (uint64_t)time(NULL);
+        be.last_used = be.created_at;
+        be.text_bytes = (uint32_t)text_len;
+        memcpy(be.sha, sha, 41);
+        memcpy(be.parent_sha, parent_sha, 41);
+
+        uint8_t h[DS4_KVBLOCK_FIXED_HEADER];
+        ds4_kvstore_block_fill_header(h, &be);
+        if (fwrite(h, 1, sizeof(h), fp) != sizeof(h)) {
+            fclose(fp);
+            unlink(tmp_path);
+            free(kvb_path);
+            free(text);
+            return false;
+        }
+
+        if (text_len > 0 && fwrite(text, 1, text_len, fp) != text_len) {
+            fclose(fp);
+            unlink(tmp_path);
+            free(kvb_path);
+            free(text);
+            return false;
+        }
+
+        char save_err[160] = {0};
+        if (ds4_session_save_block_payload(session, fp, start_tok, end_tok, save_err, sizeof(save_err)) != 0) {
+            fclose(fp);
+            unlink(tmp_path);
+            if (err && err_len > 0) snprintf(err, err_len, "save_block_payload failed: %s", save_err);
+            free(kvb_path);
+            free(text);
+            return false;
+        }
+
+        long file_pos = ftell(fp);
+        be.payload_bytes = (uint64_t)file_pos - DS4_KVBLOCK_FIXED_HEADER - (uint64_t)text_len;
+        ds4_kvstore_block_fill_header(h, &be);
+        fseek(fp, 0, SEEK_SET);
+        fwrite(h, 1, sizeof(h), fp);
+        fclose(fp);
+
+        rename(tmp_path, kvb_path);
+
+        ds4_kvstore_entry e = {0};
+        e.quant_bits = be.quant_bits;
+        e.model_id = be.model_id;
+        e.reason = be.reason;
+        e.tokens = be.end_token;
+        e.hits = 0;
+        e.ctx_size = be.ctx_size;
+        e.created_at = be.created_at;
+        e.last_used = be.last_used;
+        e.payload_bytes = be.payload_bytes;
+        e.text_bytes = be.text_bytes;
+        e.file_size = (uint64_t)file_pos;
+        e.start_token = be.start_token;
+        memcpy(e.parent_sha, be.parent_sha, 41);
+        e.text = text;
+        memcpy(e.sha, sha, 41);
+        e.path = kvb_path;
+        kv_cache_push(kc, e);
+
+        memcpy(parent_sha, sha, 41);
+        any_written = true;
+    }
+    return any_written || (num_blocks > 0);
+}
+
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -1074,6 +1371,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
 
     ds4_tokens store_tokens = {0};
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
+
+    if (store_len >= 2048 && (!cache_text_override || !cache_text_override[0])) {
+        bool ok = ds4_kvstore_store_block_chain_text(kc, engine, session, &store_tokens, reason, hooks, err, err_len);
+        ds4_tokens_free(&store_tokens);
+        return ok;
+    }
 
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (quant_bits != 2 && quant_bits != 4) {
@@ -1378,6 +1681,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
+    size_t plen = strlen(e.path);
+    if (plen >= 4 && strcmp(e.path + plen - 4, ".kvb") == 0) {
+        return ds4_kvstore_try_load_block_chain_text(kc, engine, session, prompt_text, effective_prompt, result, hooks, responses_protocol, idx);
+    }
+
     char *path = kv_xstrdup(e.path);
     const double load_t0 = kv_now_sec();
     FILE *fp = fopen(path, "rb");

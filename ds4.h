@@ -474,4 +474,13 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+uint64_t ds4_session_block_payload_bytes(ds4_session *s,
+                                         uint32_t start_token,
+                                         uint32_t end_token);
+int ds4_session_save_block_payload(ds4_session *s, FILE *fp,
+                                   uint32_t start_token, uint32_t end_token,
+                                   char *err, size_t errlen);
+int ds4_session_load_block_chain(ds4_session *s, FILE **fps, uint32_t count,
+                                 char *err, size_t errlen);
+
 #endif

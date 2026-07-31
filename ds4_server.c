@@ -16783,6 +16783,106 @@ static void test_kv_cache_block_chain_verification(void) {
     TEST_ASSERT(ds4_kvstore_verify_block_chain(chain, 3) == false);
 }
 
+static void test_kv_cache_block_chain_save_and_load(void) {
+    char tmpl[] = "/tmp/ds4-kvb-chain-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    char sha0[] = "1111111111111111111111111111111111111111";
+    char sha1[] = "2222222222222222222222222222222222222222";
+
+    ds4_kvstore_block_entry e0 = {0};
+    snprintf(e0.sha, sizeof(e0.sha), "%s", sha0);
+    e0.parent_sha[0] = '\0';
+    e0.model_id = 1;
+    e0.quant_bits = 4;
+    e0.reason = DS4_KVSTORE_REASON_CONTINUED;
+    e0.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+    e0.start_token = 0;
+    e0.end_token = 2048;
+    e0.ctx_size = 32768;
+    e0.created_at = 1000ull;
+    e0.last_used = 1000ull;
+    e0.payload_bytes = 100ull;
+    e0.text_bytes = 5;
+
+    ds4_kvstore_block_entry e1 = {0};
+    snprintf(e1.sha, sizeof(e1.sha), "%s", sha1);
+    snprintf(e1.parent_sha, sizeof(e1.parent_sha), "%s", sha0);
+    e1.model_id = 1;
+    e1.quant_bits = 4;
+    e1.reason = DS4_KVSTORE_REASON_CONTINUED;
+    e1.cache_mode_flags = DS4_KVBLOCK_MODE_GLM;
+    e1.start_token = 2048;
+    e1.end_token = 4096;
+    e1.ctx_size = 32768;
+    e1.created_at = 1001ull;
+    e1.last_used = 1001ull;
+    e1.payload_bytes = 100ull;
+    e1.text_bytes = 10;
+
+    uint8_t hdr0[DS4_KVBLOCK_FIXED_HEADER];
+    uint8_t hdr1[DS4_KVBLOCK_FIXED_HEADER];
+    ds4_kvstore_block_fill_header(hdr0, &e0);
+    ds4_kvstore_block_fill_header(hdr1, &e1);
+
+    char *path0 = path_join(dir, "block_1111111111111111111111111111111111111111.kvb");
+    char *path1 = path_join(dir, "block_2222222222222222222222222222222222222222.kvb");
+
+    FILE *fp = fopen(path0, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fwrite(hdr0, 1, sizeof(hdr0), fp);
+        fwrite("hello", 1, 5, fp);
+        char payload[100] = {0};
+        fwrite(payload, 1, 100, fp);
+        fclose(fp);
+    }
+
+    fp = fopen(path1, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fwrite(hdr1, 1, sizeof(hdr1), fp);
+        fwrite("helloworld", 1, 10, fp);
+        char payload[100] = {0};
+        fwrite(payload, 1, 100, fp);
+        fclose(fp);
+    }
+
+    char parsed_sha[41];
+    TEST_ASSERT(ds4_kvstore_sha_hex_name("block_1111111111111111111111111111111111111111.kvb", parsed_sha));
+    TEST_ASSERT(strcmp(parsed_sha, sha0) == 0);
+
+    ds4_kvstore_entry kve0 = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path0, sha0, &kve0));
+    TEST_ASSERT(kve0.tokens == 2048);
+    TEST_ASSERT(kve0.start_token == 0);
+    TEST_ASSERT(kve0.parent_sha[0] == '\0');
+    TEST_ASSERT(strcmp(kve0.text, "hello") == 0);
+
+    ds4_kvstore_entry kve1 = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path1, sha1, &kve1));
+    TEST_ASSERT(kve1.tokens == 4096);
+    TEST_ASSERT(kve1.start_token == 2048);
+    TEST_ASSERT(strcmp(kve1.parent_sha, sha0) == 0);
+    TEST_ASSERT(strcmp(kve1.text, "helloworld") == 0);
+
+    TEST_ASSERT(ds4_kvstore_touch_file(path1, 42));
+    ds4_kvstore_entry kve1_touched = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path1, sha1, &kve1_touched));
+    TEST_ASSERT(kve1_touched.hits == 42);
+
+    ds4_kvstore_entry_free(&kve0);
+    ds4_kvstore_entry_free(&kve1);
+    ds4_kvstore_entry_free(&kve1_touched);
+    unlink(path0);
+    unlink(path1);
+    free(path0);
+    free(path1);
+    rmdir(dir);
+}
+
 static void test_kv_cache_lookup_rejects_wrong_model(void) {
     char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -17679,6 +17779,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_rax_tree_branching_lookup();
     test_kv_cache_block_header_serialization();
     test_kv_cache_block_chain_verification();
+    test_kv_cache_block_chain_save_and_load();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();

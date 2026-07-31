@@ -40,6 +40,8 @@ typedef struct {
      * answers "does this checkpoint represent the bytes at the front of the
      * incoming prompt?" */
     char sha[41];
+    char parent_sha[41];
+    uint32_t start_token;
     char *path;
     char *text;
     uint8_t quant_bits;
@@ -82,6 +84,9 @@ typedef struct ds4_kvstore_block_entry {
     uint64_t last_used;
     uint64_t payload_bytes;
     uint64_t file_size;
+    uint32_t text_bytes;
+    char *text;
+    uint32_t hits;
     uint32_t refcount;
 } ds4_kvstore_block_entry;
 
